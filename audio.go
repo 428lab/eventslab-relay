@@ -15,7 +15,9 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media/oggwriter"
 )
 
-// findFFmpeg looks next to the relay binary first (a bundled build), then on PATH.
+// findFFmpeg returns the ffmpeg to use: --ffmpeg if given, else the one on PATH, else one next to
+// the relay binary (for a future bundled build). PATH comes first so that a stray "ffmpeg" that
+// lands in the Downloads folder next to the relay isn't picked over the user's installed one.
 // It returns "" when there is none; /v1/status then reports the problem.
 func findFFmpeg(explicit string) string {
 	if explicit != "" {
@@ -28,19 +30,19 @@ func findFFmpeg(explicit string) string {
 	if runtime.GOOS == "windows" {
 		name = "ffmpeg.exe"
 	}
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
 	if exe, err := os.Executable(); err == nil {
 		p := filepath.Join(filepath.Dir(exe), name)
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
 	}
-	if p, err := exec.LookPath(name); err == nil {
-		return p
-	}
 	return ""
 }
 
-var errNoFFmpeg = errors.New("ffmpeg not found (needed for audio: Opus -> AAC). Put ffmpeg next to eventslab-relay or on PATH")
+var errNoFFmpeg = errors.New("ffmpeg not found (needed for audio: Opus -> AAC). Install ffmpeg on PATH or start with --ffmpeg /path/to/ffmpeg")
 
 // aacTranscoder turns the browser's Opus into AAC-LC with a child ffmpeg (audio only):
 // RTP Opus -> Ogg (stdin) -> ffmpeg -> ADTS AAC (stdout) -> FLV AAC tags.
@@ -58,7 +60,10 @@ type aacTranscoder struct {
 	mu       sync.Mutex
 	anchorMs uint32
 	anchored bool
+	closing  bool   // Close was called; an end of ffmpeg's output is expected
+	failure  string // why audio stopped, if it stopped on its own (shown in /v1/status)
 	once     sync.Once
+	readDone chan struct{} // closed when readADTS has returned
 }
 
 const aacSampleRate = 48000
@@ -92,7 +97,7 @@ func newAACTranscoder(ffmpeg string, out *publisher, st *stats, start time.Time,
 		_ = cmd.Process.Kill()
 		return nil, err
 	}
-	t := &aacTranscoder{cmd: cmd, stdin: stdin, ogg: ogg, out: out, stats: st, start: start, logf: logf}
+	t := &aacTranscoder{cmd: cmd, stdin: stdin, ogg: ogg, out: out, stats: st, start: start, logf: logf, readDone: make(chan struct{})}
 	go t.readADTS(stdout)
 	return t, nil
 }
@@ -110,7 +115,12 @@ func (t *aacTranscoder) WriteRTP(pkt *rtp.Packet) error {
 
 // readADTS stamps ffmpeg's AAC frames by sample count from the first Opus packet's arrival
 // (the same wall clock the video uses) and sends them to RTMP.
+//
+// If ffmpeg's output breaks (lost ADTS sync) or ends while the session is still running, audio
+// has stopped: the reason goes to /v1/status, ffmpeg is killed so the Opus writer can't block on a
+// full stdin pipe, and the rest of its output is drained so ffmpeg can't block on stdout either.
 func (t *aacTranscoder) readADTS(r io.Reader) {
+	defer close(t.readDone)
 	var frames uint64
 	sentConfig := false
 	err := readADTSFrames(r, func(srIndex, channels byte, body []byte) {
@@ -126,9 +136,39 @@ func (t *aacTranscoder) readADTS(r io.Reader) {
 		t.stats.audioFrames.Add(1)
 		frames++
 	})
-	if err != nil {
-		t.logf("audio: %v", err)
+	t.mu.Lock()
+	closing := t.closing
+	t.mu.Unlock()
+	if closing && err == nil {
+		return
 	}
+	reason := "ffmpeg stopped"
+	if err != nil {
+		reason = err.Error()
+	}
+	t.fail("audio stopped: " + reason)
+	_ = t.cmd.Process.Kill()
+	_, _ = io.Copy(io.Discard, r)
+}
+
+// fail records why audio stopped (the first reason wins) and logs it.
+func (t *aacTranscoder) fail(reason string) {
+	t.mu.Lock()
+	first := t.failure == ""
+	if first {
+		t.failure = reason
+	}
+	t.mu.Unlock()
+	if first {
+		t.logf("audio: %s", reason)
+	}
+}
+
+// Failure is why audio stopped on its own ("" while it works).
+func (t *aacTranscoder) Failure() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.failure
 }
 
 // readADTSFrames splits an ADTS stream into raw AAC frames. It returns nil at EOF.
@@ -160,17 +200,35 @@ func readADTSFrames(r io.Reader, frame func(srIndex, channels byte, body []byte)
 	}
 }
 
+// closeWait bounds each step of Close.
+const closeWait = time.Second
+
+// Close stops ffmpeg and returns within about 3 s whatever state ffmpeg is in. stdin is closed
+// first: that wakes a WriteRTP stuck on a full pipe on macOS/Linux (it holds the Ogg writer's lock,
+// which ogg.Close also needs). Where closing doesn't wake a blocked write (Windows pipes), killing
+// ffmpeg does, so the kill deadline doesn't wait for ogg.Close.
 func (t *aacTranscoder) Close() {
 	t.once.Do(func() {
-		_ = t.ogg.Close()
+		t.mu.Lock()
+		t.closing = true
+		t.mu.Unlock()
 		_ = t.stdin.Close()
-		done := make(chan struct{})
-		go func() { _ = t.cmd.Wait(); close(done) }()
+		oggDone := make(chan struct{})
+		go func() { _ = t.ogg.Close(); close(oggDone) }() // the final page can't reach ffmpeg any more; fine
+		exited := make(chan struct{})
+		go func() { _ = t.cmd.Wait(); close(exited) }()
 		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
+		case <-exited:
+		case <-time.After(closeWait):
 			_ = t.cmd.Process.Kill()
-			<-done
+			select {
+			case <-exited:
+			case <-time.After(closeWait): // a grandchild holding stderr open; don't wait for it
+			}
+		}
+		select {
+		case <-oggDone:
+		case <-time.After(closeWait):
 		}
 	})
 }

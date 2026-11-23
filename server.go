@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -25,6 +28,13 @@ type server struct {
 	mu     sync.Mutex
 	target *target  // set by /v1/start; the key lives only here (memory)
 	cur    *session // the live WHIP session, if any
+
+	// whipMu serializes WHIP setup: two offers at once must not both pass "close the old one"
+	// before either new session exists, which would leave a publisher nobody can close.
+	whipMu sync.Mutex
+
+	// newSession makes a WHIP session (the real one unless a test replaces it).
+	newSession func(id, offer string, t target, ffmpeg string, logf func(string, ...any), onClose func(*session)) (*session, string, error)
 }
 
 // allowedOrigin reports whether origin may use the relay.
@@ -53,7 +63,21 @@ func (s *server) handler() http.Handler {
 	mux.Handle("POST /v1/whip", s.auth(s.whip))
 	mux.Handle("DELETE /v1/whip/{id}", s.auth(s.stopWHIP))
 	mux.Handle("GET /v1/status", s.auth(s.status))
-	return s.cors(mux)
+	return s.checkHost(s.cors(mux))
+}
+
+// checkHost accepts only requests addressed to the relay itself (127.0.0.1:<port> or
+// localhost:<port>). A page that rebinds its own DNS name to 127.0.0.1 sends its own name as Host
+// and is refused with 421, whatever it tries next.
+func (s *server) checkHost(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, port, err := net.SplitHostPort(r.Host)
+		if err != nil || port == "" || (host != "127.0.0.1" && host != "localhost") {
+			writeJSON(w, http.StatusMisdirectedRequest, map[string]string{"error": "bad_host"})
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // cors answers preflights and adds CORS headers only for allowed origins. Other origins get no
@@ -119,6 +143,12 @@ func (s *server) handlePair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, err := s.pair.Pair(origin, strings.TrimSpace(in.Code))
+	var locked *lockedError
+	if errors.As(err, &locked) {
+		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(locked.wait.Seconds()))))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too_many_attempts", "retryAfterSeconds": int(math.Ceil(locked.wait.Seconds()))})
+		return
+	}
 	if errors.Is(err, errBadCode) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "wrong_code"})
 		return
@@ -163,6 +193,8 @@ func (s *server) whip(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_offer"})
 		return
 	}
+	s.whipMu.Lock()
+	defer s.whipMu.Unlock()
 	s.mu.Lock()
 	t := s.target
 	old := s.cur
@@ -176,7 +208,17 @@ func (s *server) whip(w http.ResponseWriter, r *http.Request) {
 		old.Close() // one stream at a time
 	}
 	id := randomID()
-	sess, answer, err := newSession(id, string(offer), *t, s.ffmpeg, s.logf)
+	mk := s.newSession
+	if mk == nil {
+		mk = newSession
+	}
+	sess, answer, err := mk(id, string(offer), *t, s.ffmpeg, s.logf, func(sess *session) {
+		s.mu.Lock()
+		if s.cur == sess {
+			s.cur = nil
+		}
+		s.mu.Unlock()
+	})
 	if err != nil {
 		s.logf("whip: %v", scrub(err, t.key))
 		status := http.StatusBadRequest
@@ -186,15 +228,12 @@ func (s *server) whip(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]string{"error": "whip_failed", "message": scrub(err, t.key).Error()})
 		return
 	}
-	sess.onClose = func() {
-		s.mu.Lock()
-		if s.cur == sess {
-			s.cur = nil
-		}
-		s.mu.Unlock()
-	}
 	s.mu.Lock()
-	s.cur = sess
+	select {
+	case <-sess.done: // it already closed itself (onClose ran before it was registered)
+	default:
+		s.cur = sess
+	}
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/sdp")
 	w.Header().Set("Location", "/v1/whip/"+id)

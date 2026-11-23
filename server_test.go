@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const eventsOrigin = "https://events.kojira.io"
@@ -117,8 +118,11 @@ func TestAuthAndPairing(t *testing.T) {
 	if res := do(t, ts, "POST", "/v1/pair", eventsOrigin, "", `{"origin":"https://evil.example","code":"`+s.pair.Code()+`"}`); res.StatusCode != 403 {
 		t.Fatalf("pair with mismatched origin: %d", res.StatusCode)
 	}
-	// wrong code -> 403; five wrong codes make a new code
+	// wrong code -> 403; five wrong codes make a new code (the lockout is skipped here with a
+	// test clock that jumps past it; TestPairingLockout covers the lockout itself)
 	first := s.pair.Code()
+	clock := time.Now()
+	s.pair.now = func() time.Time { clock = clock.Add(time.Minute); return clock }
 	for i := 0; i < maxCodeAttempts; i++ {
 		if res := do(t, ts, "POST", "/v1/pair", eventsOrigin, "", `{"origin":"`+eventsOrigin+`","code":"xxxxxx"}`); res.StatusCode != 403 {
 			t.Fatalf("wrong code: %d", res.StatusCode)

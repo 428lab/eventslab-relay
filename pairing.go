@@ -12,10 +12,25 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // maxCodeAttempts: after this many wrong codes the pairing code is regenerated (design §4.3).
 const maxCodeAttempts = 5
+
+// Wrong codes also slow guessing down: from the lockoutAfter-th wrong code in a row, pairing is
+// refused for lockoutBase, doubling with each further wrong code up to lockoutMax. A right code
+// resets it. Any local program can send any Origin header, so this is what bounds blind guessing.
+const (
+	lockoutAfter = 3
+	lockoutBase  = time.Second
+	lockoutMax   = 30 * time.Second
+)
+
+// lockedError: pairing is locked for wait after too many wrong codes.
+type lockedError struct{ wait time.Duration }
+
+func (e *lockedError) Error() string { return fmt.Sprintf("too many wrong codes; retry in %s", e.wait) }
 
 // pairing holds the 6-digit code shown in the console and the tokens issued to origins.
 // Tokens are stored hashed (SHA-256) in the user's config dir, so pairing survives restarts.
@@ -26,6 +41,10 @@ type pairing struct {
 	path     string            // tokens file; "" = memory only (tests)
 	tokens   map[string]string // sha256(token) hex -> origin
 	onCode   func(code string) // called when a new code is made (console)
+
+	wrongRun    int       // wrong codes in a row (not reset by a new code)
+	lockedUntil time.Time // no pairing before this
+	now         func() time.Time
 }
 
 type tokenFile struct {
@@ -43,7 +62,7 @@ func configDir() (string, error) {
 }
 
 func newPairing(path string, onCode func(string)) (*pairing, error) {
-	p := &pairing{path: path, tokens: map[string]string{}, onCode: onCode}
+	p := &pairing{path: path, tokens: map[string]string{}, onCode: onCode, now: time.Now}
 	if path != "" {
 		b, err := os.ReadFile(path)
 		switch {
@@ -94,13 +113,22 @@ var errBadCode = errors.New("wrong pairing code")
 func (p *pairing) Pair(origin, code string) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if now := p.now(); now.Before(p.lockedUntil) {
+		return "", &lockedError{wait: p.lockedUntil.Sub(now)}
+	}
 	if subtle.ConstantTimeCompare([]byte(code), []byte(p.code)) != 1 {
 		p.attempts++
+		p.wrongRun++
 		if p.attempts >= maxCodeAttempts {
 			p.newCode()
 		}
+		if p.wrongRun >= lockoutAfter {
+			wait := lockoutBase << min(p.wrongRun-lockoutAfter, 5)
+			p.lockedUntil = p.now().Add(min(wait, lockoutMax))
+		}
 		return "", errBadCode
 	}
+	p.wrongRun, p.lockedUntil = 0, time.Time{}
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err

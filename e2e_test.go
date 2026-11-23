@@ -107,6 +107,11 @@ func startSink(t *testing.T) *sink {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return serveSink(t, ln)
+}
+
+func serveSink(t *testing.T, ln net.Listener) *sink {
+	t.Helper()
 	s := &sink{ln: ln}
 	s.srv = rtmp.NewServer(&rtmp.ServerConfig{OnConnect: func(c net.Conn) (io.ReadWriteCloser, *rtmp.ConnConfig) {
 		s.mu.Lock()

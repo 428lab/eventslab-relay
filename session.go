@@ -88,8 +88,9 @@ func newAPI() (*webrtc.API, error) {
 	return webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir), webrtc.WithSettingEngine(se)), nil
 }
 
-// newSession answers the browser's SDP offer and starts publishing to t.
-func newSession(id, offer string, t target, ffmpeg string, logf func(string, ...any)) (*session, string, error) {
+// newSession answers the browser's SDP offer and starts publishing to t. onClose runs once when
+// the session closes; it is set before any callback that may close the session is registered.
+func newSession(id, offer string, t target, ffmpeg string, logf func(string, ...any), onClose func(*session)) (*session, string, error) {
 	api, err := newAPI()
 	if err != nil {
 		return nil, "", err
@@ -100,6 +101,9 @@ func newSession(id, offer string, t target, ffmpeg string, logf func(string, ...
 	}
 	s := &session{id: id, pc: pc, stats: newStats(), start: time.Now(), logf: logf,
 		done: make(chan struct{}), needKey: make(chan struct{}, 1), state: "connecting"}
+	if onClose != nil {
+		s.onClose = func() { onClose(s) }
+	}
 	s.out = newPublisher(t, s.stats, s.requestKeyframe, logf)
 	s.audio, err = newAACTranscoder(ffmpeg, s.out, s.stats, s.start, logf)
 	if err != nil {
@@ -167,16 +171,24 @@ func (s *session) setState(st, errText string) {
 	s.mu.Unlock()
 }
 
+// State is the session state and its last error. When audio stopped on its own (ffmpeg died or
+// its output broke) and nothing else is wrong, that is the error shown.
 func (s *session) State() (string, string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.state, s.lastErr
+	st, errText := s.state, s.lastErr
+	s.mu.Unlock()
+	if errText == "" && s.audio != nil {
+		errText = s.audio.Failure()
+	}
+	return st, errText
 }
 
 func (s *session) Close() {
 	s.closeOnce.Do(func() {
 		close(s.done)
-		_ = s.pc.Close()
+		if s.pc != nil {
+			_ = s.pc.Close()
+		}
 		if s.audio != nil {
 			s.audio.Close()
 		}
@@ -275,8 +287,21 @@ type videoIngest struct {
 	needKey func()
 
 	started bool
-	firstTS uint32
+	lastTS  uint32 // RTP timestamp of the previous sample
+	elapsed int64  // 90 kHz ticks since the first sample (int64: no wrap after 13 h)
 	anchor  time.Duration
+}
+
+// mediaMs is the FLV timestamp of a video sample: the first sample's arrival time plus the RTP
+// clock elapsed since. The RTP timestamp is a uint32 at 90 kHz and wraps after about 13.25 h, so
+// the difference to the previous sample is taken as a signed 32-bit step and added up in int64.
+func (v *videoIngest) mediaMs(rtpTS uint32) uint32 {
+	if !v.started {
+		v.lastTS, v.elapsed, v.anchor, v.started = rtpTS, 0, time.Since(v.start), true
+	}
+	v.elapsed += int64(int32(rtpTS - v.lastTS))
+	v.lastTS = rtpTS
+	return uint32(int64(v.anchor/time.Millisecond) + v.elapsed/90)
 }
 
 func newVideoIngest(start time.Time, st *stats, out *publisher, needKey func()) *videoIngest {
@@ -295,10 +320,7 @@ func (v *videoIngest) Push(pkt *rtp.Packet) {
 			v.stats.resyncs.Add(1)
 			v.needKey()
 		}
-		if !v.started {
-			v.firstTS, v.anchor, v.started = sample.PacketTimestamp, time.Since(v.start), true
-		}
-		ms := uint32(v.anchor/time.Millisecond) + (sample.PacketTimestamp-v.firstTS)/90
+		ms := v.mediaMs(sample.PacketTimestamp)
 		bad := v.conv.badIDR
 		tags, key := v.conv.Convert(sample.Data, ms)
 		if v.conv.badIDR != bad {

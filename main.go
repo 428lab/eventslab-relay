@@ -30,7 +30,7 @@ const (
 func main() {
 	dev := flag.Bool("dev", false, "also allow http://localhost:* and http://127.0.0.1:* pages (development)")
 	port := flag.Int("port", 0, "listen on this port only (default: 47801, then 47802-47809)")
-	ffmpegPath := flag.String("ffmpeg", "", "path to ffmpeg (default: next to this program, then PATH)")
+	ffmpegPath := flag.String("ffmpeg", "", "path to ffmpeg (default: PATH, then next to this program)")
 	rtmpTest := flag.String("rtmp-test", "", "publish a local test pattern to this RTMP URL and exit (smoke test; needs ffmpeg)")
 	testSeconds := flag.Int("rtmp-test-seconds", 10, "length of the --rtmp-test pattern in seconds")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -75,6 +75,8 @@ func main() {
 	fmt.Println("In events lab's live screen, press \"Connect relay\" and enter this code.")
 	if ffmpeg == "" {
 		fmt.Println("注意: ffmpeg が見つかりません（音声の変換に必要です）。/ Warning: ffmpeg not found (needed for audio).")
+	} else {
+		fmt.Printf("音声の変換に使う ffmpeg / ffmpeg for audio: %s\n", ffmpeg)
 	}
 	if *dev {
 		fmt.Println("開発モード: localhost のページからも使えます。/ Dev mode: localhost pages are allowed.")

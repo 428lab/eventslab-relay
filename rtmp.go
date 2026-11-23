@@ -69,8 +69,88 @@ func (t target) String() string {
 // may echo command bodies such as the stream name). The relay doesn't use logrus, so silence it.
 func init() { logrus.SetOutput(io.Discard) }
 
-// connect dials, connects and publishes. It returns the open stream.
-func (t target) connect() (*rtmp.ClientConn, *rtmp.Stream, error) {
+// rtmpConnectTimeout bounds one whole connect attempt: dial, RTMP handshake, connect,
+// createStream, publish and the metadata write. go-rtmp waits for the server's replies without a
+// timeout (context.TODO), so a server that stalls or drops the connection mid-handshake would
+// otherwise block the publisher forever and stop every later reconnect.
+const rtmpConnectTimeout = 15 * time.Second
+
+var errPublisherClosed = errors.New("publisher closed")
+
+// connect runs one connect attempt with a deadline that done can cut short. On timeout the
+// half-open connection is closed and an error returned, so the caller's backoff loop goes on.
+// go-rtmp offers no way to cancel its pending wait, so a goroutine stuck inside the library is
+// left behind (it closes its connection itself if it ever finishes).
+func (t target) connect(done <-chan struct{}, timeout time.Duration) (*rtmp.ClientConn, *rtmp.Stream, error) {
+	type result struct {
+		conn   *rtmp.ClientConn
+		stream *rtmp.Stream
+		err    error
+	}
+	var (
+		mu        sync.Mutex
+		cur       *rtmp.ClientConn
+		abandoned bool
+	)
+	ch := make(chan result, 1)
+	go func() {
+		conn, err := t.dial()
+		if err != nil {
+			ch <- result{err: err}
+			return
+		}
+		mu.Lock()
+		if abandoned {
+			mu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		cur = conn
+		mu.Unlock()
+		stream, err := t.setup(conn)
+		mu.Lock()
+		late := abandoned
+		mu.Unlock()
+		if late { // the caller gave up meanwhile
+			_ = conn.Close()
+			return
+		}
+		if err != nil {
+			ch <- result{err: err}
+			return
+		}
+		ch <- result{conn: conn, stream: stream}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var why error
+	select {
+	case r := <-ch:
+		return r.conn, r.stream, r.err
+	case <-timer.C:
+		why = fmt.Errorf("rtmp connect to %s timed out after %s", t.host, timeout)
+	case <-done:
+		why = errPublisherClosed
+	}
+	mu.Lock()
+	abandoned = true
+	c := cur
+	mu.Unlock()
+	if c != nil {
+		_ = c.Close()
+	}
+	select { // it may have finished right at the deadline
+	case r := <-ch:
+		if r.conn != nil {
+			_ = r.conn.Close()
+		}
+	default:
+	}
+	return nil, nil, why
+}
+
+// dial opens the TCP (or TLS) connection and does the RTMP handshake.
+func (t target) dial() (*rtmp.ClientConn, error) {
 	quiet := logrus.New()
 	quiet.SetOutput(io.Discard) // the library logs the stream name (= the key) at info level
 	cfg := &rtmp.ConnConfig{Logger: quiet}
@@ -84,11 +164,17 @@ func (t target) connect() (*rtmp.ClientConn, *rtmp.Stream, error) {
 		conn, err = rtmp.DialWithDialer(dialer, "rtmp", t.host, cfg)
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("rtmp dial %s: %w", t.host, scrub(err, t.key))
+		return nil, fmt.Errorf("rtmp dial %s: %w", t.host, scrub(err, t.key))
 	}
-	fail := func(step string, err error) (*rtmp.ClientConn, *rtmp.Stream, error) {
-		conn.Close()
-		return nil, nil, fmt.Errorf("rtmp %s: %w", step, scrub(err, t.key))
+	return conn, nil
+}
+
+// setup sends connect, createStream, publish and the metadata on an open connection. On error
+// the connection is closed.
+func (t target) setup(conn *rtmp.ClientConn) (*rtmp.Stream, error) {
+	fail := func(step string, err error) (*rtmp.Stream, error) {
+		_ = conn.Close()
+		return nil, fmt.Errorf("rtmp %s: %w", step, scrub(err, t.key))
 	}
 	tcURL := fmt.Sprintf("%s://%s/%s", t.scheme, strings.TrimSuffix(strings.TrimSuffix(t.host, ":1935"), ":443"), t.app)
 	if err := conn.Connect(&rtmpmsg.NetConnectionConnect{Command: rtmpmsg.NetConnectionConnectCommand{
@@ -108,7 +194,7 @@ func (t target) connect() (*rtmp.ClientConn, *rtmp.Stream, error) {
 	}); err != nil {
 		return fail("metadata", err)
 	}
-	return conn, stream, nil
+	return stream, nil
 }
 
 // scrub removes the key from an error text (libraries may echo the stream name).
@@ -131,9 +217,12 @@ type publisher struct {
 	needKey func()
 	logf    func(string, ...any)
 
-	ch   chan tag
-	done chan struct{}
-	once sync.Once
+	ch      chan tag
+	done    chan struct{}
+	stopped chan struct{} // closed when the writer goroutine has returned
+	once    sync.Once
+
+	connectTimeout time.Duration // per connect attempt (rtmpConnectTimeout; shorter in tests)
 
 	mu       sync.Mutex
 	state    string
@@ -148,7 +237,8 @@ var defaultBackoffs = []time.Duration{time.Second, 2 * time.Second, 4 * time.Sec
 
 func newPublisher(t target, st *stats, needKey func(), logf func(string, ...any)) *publisher {
 	p := &publisher{target: t, stats: st, needKey: needKey, logf: logf,
-		ch: make(chan tag, 512), done: make(chan struct{}), state: rtmpIdle, backoffs: defaultBackoffs}
+		ch: make(chan tag, 512), done: make(chan struct{}), stopped: make(chan struct{}), state: rtmpIdle,
+		backoffs: defaultBackoffs, connectTimeout: rtmpConnectTimeout}
 	return p
 }
 
@@ -188,6 +278,7 @@ func (p *publisher) Send(t tag, isConfig bool) {
 }
 
 func (p *publisher) loop() {
+	defer close(p.stopped)
 	attempt := 0
 	for {
 		select {
@@ -195,7 +286,10 @@ func (p *publisher) loop() {
 			return
 		default:
 		}
-		conn, stream, err := p.target.connect()
+		conn, stream, err := p.target.connect(p.done, p.connectTimeout)
+		if errors.Is(err, errPublisherClosed) {
+			return
+		}
 		if err != nil {
 			wait := p.backoffs[min(attempt, len(p.backoffs)-1)]
 			attempt++

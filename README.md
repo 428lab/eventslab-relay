@@ -25,12 +25,15 @@
 
 ### ffmpeg が要ります（音声の変換）
 
-今の版は ffmpeg を同梱していません。次のどちらかで用意してください。
+今の版は ffmpeg を同梱していません（同梱は後の版で行います）。次のどちらかで用意してください。
 
-- 中継アプリと**同じフォルダ**に `ffmpeg`（Windows は `ffmpeg.exe`）を置く
-- `PATH` の通った場所に ffmpeg を入れる（Mac なら `brew install ffmpeg`）
+- `PATH` の通った場所に ffmpeg を入れる（Mac なら `brew install ffmpeg`）。ふつうはこちら
+- 置き場所を指定して起動する: `./eventslab-relay --ffmpeg /path/to/ffmpeg`
 
-見つからないと、起動したときに注意が出て、配信を始められません。
+起動すると、使う ffmpeg の場所が画面に出ます。見つからないと注意が出て、配信を始められません。
+
+探す順番は `--ffmpeg` → `PATH` → 中継アプリと同じフォルダ です。同じフォルダは最後にしてあります。
+「ダウンロード」フォルダなどにたまたま置かれた別の `ffmpeg` を、勝手に使わないためです。
 
 ## 初めて起動するとき（署名していないアプリの警告）
 
@@ -83,7 +86,7 @@
 |---|---|
 | events lab が「中継アプリが動いていません」と言う | 中継アプリが起動しているか。ほかのアプリが 47801〜47809 を全部使っていないか |
 | 「ローカルネットワークへのアクセス」を拒否してしまった | Chrome のアドレスバーの左のアイコン →「サイトの設定」→「ローカル ネットワーク アクセス」を「許可」に |
-| ペアリングの番号が合わない | 5 回間違えると番号が変わります。中継アプリの画面の新しい番号を入れてください |
+| ペアリングの番号が合わない | 5 回間違えると番号が変わります。中継アプリの画面の新しい番号を入れてください。3 回続けて間違えると、少しのあいだ（1〜30 秒）番号を受け付けません。少し待ってから入れ直してください |
 | 「ffmpeg が見つかりません」 | 上の「ffmpeg が要ります」を見てください |
 | YouTube に映らない | 配信キーが合っているか。中継アプリの画面に `rtmp:` から始まる失敗の行が出ていないか（自動でつなぎ直します） |
 | 映像がカクカクする・PC が重い | events lab の配信画面に「ハードウェアエンコーダーが使われていません」と出ていないか。Chrome の `chrome://gpu` で「Video Encode: Hardware accelerated」になっているか |
@@ -91,12 +94,13 @@
 ## 中継アプリの API（events lab 向け）
 
 `http://127.0.0.1:<port>` で待ち受けます。`/v1/hello` と `/v1/pair` 以外は、ペアリングでもらったトークンを `Authorization: Bearer <token>` で付けます。
+宛先（`Host`）が `127.0.0.1:<port>` か `localhost:<port>` でない要求は、421 で断ります（DNS リバインディング対策）。
 応答を読めるのは、許可した origin（`https://events.kojira.io` と `https://eventer-staging.kojiran.workers.dev`）のページだけです。
 
 | メソッドとパス | 中身 |
 |---|---|
 | `GET /v1/hello` | `{ app, version, paired }` |
-| `POST /v1/pair` | `{ origin, code }` → `{ token }`（403 は番号違いか、許可していない origin） |
+| `POST /v1/pair` | `{ origin, code }` → `{ token }`（403 は番号違いか、許可していない origin。429 は間違いが続いたので少し待つ。`Retry-After` に秒数） |
 | `POST /v1/start` | `{ rtmpUrl, streamKey }` → `{ whipUrl }`。鍵はメモリにだけ置く |
 | `POST /v1/whip` | WHIP（`Content-Type: application/sdp`）。201 と `Location: /v1/whip/<id>` |
 | `DELETE /v1/whip/<id>` | 配信を止める |
